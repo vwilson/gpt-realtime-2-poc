@@ -73,13 +73,15 @@ jobs:
 
   build-mac:
     name: Mac Catalyst ${{ matrix.rid }}
-    runs-on: macos-latest
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
-        rid:
-          - maccatalyst-x64
-          - maccatalyst-arm64
+        include:
+          - rid: maccatalyst-arm64
+            runner: macos-26
+          - rid: maccatalyst-x64
+            runner: macos-26-intel
 
     steps:
       - name: Checkout
@@ -89,6 +91,20 @@ jobs:
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Select Xcode 26.4
+        run: |
+          set -euo pipefail
+
+          xcode_path="$(find /Applications -maxdepth 1 -name "Xcode_26.4*.app" -print | sort | tail -n 1)"
+          if [[ -z "$xcode_path" ]]; then
+            echo "::error::Xcode 26.4 is required for .NET 10 Mac Catalyst."
+            ls -1 /Applications | grep '^Xcode' || true
+            exit 1
+          fi
+
+          sudo xcode-select -s "$xcode_path/Contents/Developer"
+          xcodebuild -version
 
       - name: Install MAUI workload
         run: dotnet workload install maui-maccatalyst
