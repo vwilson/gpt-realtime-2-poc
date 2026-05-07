@@ -160,7 +160,6 @@ jobs:
         run: |
           set -euo pipefail
 
-          publish_dir="$RUNNER_TEMP/realtime-vibe-$RID"
           dotnet publish "$PROJECT_PATH" \
             -f "$MAC_TFM" \
             -c Release \
@@ -170,13 +169,13 @@ jobs:
             -p:_RequireCodeSigning=false \
             -p:ACToolPath="$MD_APPLE_SDK_ROOT/Contents/Developer/usr/bin/actool" \
             -p:IBToolPath="$MD_APPLE_SDK_ROOT/Contents/Developer/usr/bin/ibtool" \
-            -p:MtouchLink=SdkOnly \
-            -o "$publish_dir"
+            -p:MtouchLink=SdkOnly
 
-          app_path="$(find "$publish_dir" -maxdepth 4 -type d -name "*.app" | head -n 1)"
+          publish_dir="$PWD/bin/Release/$MAC_TFM/$RID"
+          app_path="$(find "$publish_dir" "$PWD/bin/Release/$MAC_TFM" -maxdepth 3 -type d -name "*.app" | head -n 1)"
           if [[ -z "$app_path" ]]; then
             echo "::error::No .app bundle was produced."
-            find "$publish_dir" -maxdepth 4 -print
+            find "$PWD/bin/Release/$MAC_TFM" -maxdepth 5 -print
             exit 1
           fi
 
