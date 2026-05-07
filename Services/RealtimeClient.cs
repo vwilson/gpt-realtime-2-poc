@@ -16,7 +16,7 @@ public sealed class RealtimeClient(ILogger<RealtimeClient> logger) : IAsyncDispo
     private ClientWebSocket? _socket;
     private CancellationTokenSource? _sessionCts;
     private RealtimeSessionOptions? _options;
-    private bool _audioAppended;
+    private readonly HashSet<string> _seenUserTranscriptItems = [];
 
     public event Action<RealtimeClientNotification>? NotificationReceived;
 
@@ -65,7 +65,7 @@ public sealed class RealtimeClient(ILogger<RealtimeClient> logger) : IAsyncDispo
     {
         var socket = _socket;
         _socket = null;
-        _audioAppended = false;
+        _seenUserTranscriptItems.Clear();
 
         if (socket is null)
         {
@@ -102,7 +102,6 @@ public sealed class RealtimeClient(ILogger<RealtimeClient> logger) : IAsyncDispo
             return Task.CompletedTask;
         }
 
-        _audioAppended = true;
         return SendEventAsync(new
         {
             type = "input_audio_buffer.append",
@@ -112,24 +111,10 @@ public sealed class RealtimeClient(ILogger<RealtimeClient> logger) : IAsyncDispo
 
     public async Task ClearInputAudioAsync()
     {
-        _audioAppended = false;
         await SendEventAsync(new { type = "input_audio_buffer.clear" });
     }
 
-    public async Task CommitAudioAndRespondAsync()
-    {
-        if (!_audioAppended)
-        {
-            Emit(RealtimeNotificationKind.Error, "No audio reached the client before stop.");
-            return;
-        }
-
-        await SendEventAsync(new { type = "input_audio_buffer.commit" });
-        _audioAppended = false;
-        await CreateResponseAsync(speak: true);
-    }
-
-    public async Task SendTextAsync(string text, bool speak)
+    public async Task SendTextAsync(string text)
     {
         if (string.IsNullOrWhiteSpace(text))
         {
@@ -154,7 +139,7 @@ public sealed class RealtimeClient(ILogger<RealtimeClient> logger) : IAsyncDispo
             }
         });
 
-        await CreateResponseAsync(speak);
+        await CreateTextResponseAsync();
     }
 
     private async Task SendSessionUpdateAsync(RealtimeSessionOptions options, CancellationToken cancellationToken)
@@ -166,7 +151,15 @@ public sealed class RealtimeClient(ILogger<RealtimeClient> logger) : IAsyncDispo
                 type = "audio/pcm",
                 rate = 24000
             },
-            ["turn_detection"] = null,
+            ["turn_detection"] = new
+            {
+                type = "server_vad",
+                threshold = 0.5,
+                prefix_padding_ms = 300,
+                silence_duration_ms = 500,
+                create_response = true,
+                interrupt_response = true
+            },
             ["noise_reduction"] = new
             {
                 type = "near_field"
@@ -194,7 +187,8 @@ public sealed class RealtimeClient(ILogger<RealtimeClient> logger) : IAsyncDispo
                 {
                     format = new
                     {
-                        type = "audio/pcm"
+                        type = "audio/pcm",
+                        rate = 24000
                     },
                     voice = options.Voice
                 }
@@ -208,27 +202,12 @@ public sealed class RealtimeClient(ILogger<RealtimeClient> logger) : IAsyncDispo
         }, cancellationToken);
     }
 
-    private Task CreateResponseAsync(bool speak)
+    private Task CreateTextResponseAsync()
     {
         var response = new Dictionary<string, object?>
         {
-            ["output_modalities"] = new[] { speak ? "audio" : "text" }
+            ["output_modalities"] = new[] { "text" }
         };
-
-        if (speak && _options is not null)
-        {
-            response["audio"] = new
-            {
-                output = new
-                {
-                    format = new
-                    {
-                        type = "audio/pcm"
-                    },
-                    voice = _options.Voice
-                }
-            };
-        }
 
         return SendEventAsync(new
         {
@@ -247,6 +226,7 @@ public sealed class RealtimeClient(ILogger<RealtimeClient> logger) : IAsyncDispo
 
         var json = JsonSerializer.Serialize(payload, JsonOptions);
         var bytes = Encoding.UTF8.GetBytes(json);
+        EmitClientEvent(json);
 
         await _sendLock.WaitAsync(cancellationToken);
         try
@@ -312,7 +292,9 @@ public sealed class RealtimeClient(ILogger<RealtimeClient> logger) : IAsyncDispo
             switch (eventType)
             {
                 case "error":
-                    Emit(RealtimeNotificationKind.Error, ExtractError(root), eventType, rawJson: json);
+                    var errorMessage = ExtractError(root);
+                    logger.LogWarning("Realtime API error: {Error}", errorMessage);
+                    Emit(RealtimeNotificationKind.Error, errorMessage, eventType, rawJson: json);
                     break;
 
                 case "response.output_audio.delta":
@@ -328,15 +310,23 @@ public sealed class RealtimeClient(ILogger<RealtimeClient> logger) : IAsyncDispo
                     break;
 
                 case "conversation.item.input_audio_transcription.completed":
-                    Emit(RealtimeNotificationKind.UserTranscript, "user", eventType, TryGetString(root, "transcript") ?? TryGetString(root, "text"), json);
+                    EmitUserTranscriptOnce(root, eventType, TryGetString(root, "transcript") ?? TryGetString(root, "text"), json);
                     break;
 
                 case "conversation.item.input_audio_transcription.segment":
-                    Emit(RealtimeNotificationKind.UserTranscript, "user", eventType, TryGetString(root, "text"), json);
+                    Emit(RealtimeNotificationKind.ServerEvent, TryGetString(root, "text") ?? eventType, eventType, rawJson: json);
+                    break;
+
+                case "conversation.item.input_audio_transcription.failed":
+                    Emit(RealtimeNotificationKind.Error, ExtractError(root), eventType, rawJson: json);
+                    break;
+
+                case "conversation.item.done":
+                    EmitUserTranscriptOnce(root, eventType, ExtractUserTranscript(root), json);
                     break;
 
                 case "response.done":
-                    Emit(RealtimeNotificationKind.ResponseDone, "Response complete", eventType, rawJson: json);
+                    Emit(RealtimeNotificationKind.ResponseDone, "Response complete", eventType, ExtractResponseText(root), json);
                     break;
             }
         }
@@ -351,12 +341,129 @@ public sealed class RealtimeClient(ILogger<RealtimeClient> logger) : IAsyncDispo
     {
         if (root.TryGetProperty("error", out var error))
         {
-            return TryGetString(error, "message")
-                ?? TryGetString(error, "code")
-                ?? error.ToString();
+            var message = TryGetString(error, "message");
+            var code = TryGetString(error, "code");
+            var param = TryGetString(error, "param");
+            var type = TryGetString(error, "type");
+
+            return string.Join(" ", new[]
+                {
+                    code,
+                    param is null ? null : $"({param})",
+                    message,
+                    type is null ? null : $"[{type}]"
+                }
+                .Where(part => !string.IsNullOrWhiteSpace(part)))
+                .Trim();
         }
 
         return root.ToString();
+    }
+
+    private void EmitUserTranscriptOnce(JsonElement root, string eventType, string? transcript, string json)
+    {
+        if (string.IsNullOrWhiteSpace(transcript))
+        {
+            return;
+        }
+
+        var itemId = TryGetString(root, "item_id") ?? TryGetNestedString(root, "item", "id");
+        if (!string.IsNullOrWhiteSpace(itemId) && !_seenUserTranscriptItems.Add(itemId))
+        {
+            return;
+        }
+
+        Emit(RealtimeNotificationKind.UserTranscript, "user", eventType, transcript.Trim(), json);
+    }
+
+    private static string? ExtractUserTranscript(JsonElement root)
+    {
+        if (!root.TryGetProperty("item", out var item)
+            || !StringEquals(item, "role", "user")
+            || !item.TryGetProperty("content", out var content))
+        {
+            return null;
+        }
+
+        return ExtractTextFromContent(content);
+    }
+
+    private static string? ExtractResponseText(JsonElement root)
+    {
+        if (!root.TryGetProperty("response", out var response)
+            || !response.TryGetProperty("output", out var output)
+            || output.ValueKind != JsonValueKind.Array)
+        {
+            return null;
+        }
+
+        var parts = new List<string>();
+        foreach (var item in output.EnumerateArray())
+        {
+            if (item.TryGetProperty("content", out var content))
+            {
+                var text = ExtractTextFromContent(content);
+                if (!string.IsNullOrWhiteSpace(text))
+                {
+                    parts.Add(text);
+                }
+            }
+        }
+
+        return parts.Count == 0 ? null : string.Join(Environment.NewLine, parts).Trim();
+    }
+
+    private static string? ExtractTextFromContent(JsonElement content)
+    {
+        if (content.ValueKind != JsonValueKind.Array)
+        {
+            return null;
+        }
+
+        var parts = new List<string>();
+        foreach (var part in content.EnumerateArray())
+        {
+            var text = TryGetString(part, "text") ?? TryGetString(part, "transcript");
+            if (!string.IsNullOrWhiteSpace(text))
+            {
+                parts.Add(text);
+            }
+        }
+
+        return parts.Count == 0 ? null : string.Join(Environment.NewLine, parts).Trim();
+    }
+
+    private static bool StringEquals(JsonElement element, string propertyName, string expected)
+    {
+        return string.Equals(TryGetString(element, propertyName), expected, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string? TryGetNestedString(JsonElement element, string parentPropertyName, string childPropertyName)
+    {
+        return element.TryGetProperty(parentPropertyName, out var parent)
+            ? TryGetString(parent, childPropertyName)
+            : null;
+    }
+
+    private void EmitClientEvent(string json)
+    {
+        try
+        {
+            using var document = JsonDocument.Parse(json);
+            var eventType = TryGetString(document.RootElement, "type") ?? "client.event";
+
+            if (eventType == "input_audio_buffer.append")
+            {
+                return;
+            }
+
+            logger.LogDebug("Realtime client event {EventType}: {Payload}", eventType, json);
+            Emit(RealtimeNotificationKind.ClientEvent, $"send {eventType}", eventType, rawJson: json);
+        }
+        catch (Exception ex)
+        {
+            logger.LogDebug(ex, "Unable to parse outbound Realtime event.");
+        }
     }
 
     private static string? TryGetString(JsonElement element, string propertyName)

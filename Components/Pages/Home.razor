@@ -31,7 +31,7 @@
                 </label>
                 <label>
                     Voice
-                    <select @bind="Voice" disabled="@Client.IsConnected">
+                    <select value="@Voice" @onchange="OnVoiceChangedAsync" disabled="@IsBusy">
                         @foreach (var voice in Voices)
                         {
                             <option value="@voice">@voice</option>
@@ -52,7 +52,7 @@
 
             <div class="button-row">
                 <button class="primary" @onclick="ConnectAsync" disabled="@(!CanConnect)">Connect</button>
-                <button class="secondary" @onclick="DisconnectAsync" disabled="@(!Client.IsConnected)">Disconnect</button>
+                <button class="secondary" @onclick="DisconnectAsync" disabled="@(!Client.IsConnected || IsBusy)">Disconnect</button>
             </div>
         </div>
 
@@ -62,19 +62,36 @@
                 <span class="small-metric">@AudioChunkCount chunks</span>
             </div>
 
-            <button class="talk-button @(IsRecording ? "recording" : "")" @onclick="ToggleRecordingAsync" disabled="@(!Client.IsConnected)">
-                <span>@(IsRecording ? "Stop and respond" : "Start talking")</span>
-            </button>
-
-            <div class="meter" aria-hidden="true">
-                <span style="width: @MeterWidth"></span>
+            <div class="audio-viz @(IsRecording ? "active recording" : "")" aria-hidden="true">
+                <span></span><span></span><span></span><span></span><span></span>
+                <span></span><span></span><span></span><span></span><span></span>
+                <span></span><span></span><span></span><span></span><span></span>
             </div>
+
+            <button class="talk-button @(IsRecording ? "recording" : "")" @onclick="ToggleRecordingAsync" disabled="@(!Client.IsConnected || IsBusy)">
+                @if (IsRecording)
+                {
+                    <svg class="mic-icon" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+                        <rect x="6" y="6" width="12" height="12" rx="2" />
+                    </svg>
+                    <span>Stop listening</span>
+                }
+                else
+                {
+                    <svg class="mic-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                        <rect x="9" y="2" width="6" height="12" rx="3" />
+                        <path d="M5 11a7 7 0 0 0 14 0" />
+                        <line x1="12" y1="18" x2="12" y2="22" />
+                        <line x1="8" y1="22" x2="16" y2="22" />
+                    </svg>
+                    <span>Start talking</span>
+                }
+            </button>
 
             <div class="quick-text">
                 <textarea @bind="TypedPrompt" placeholder="Type a prompt"></textarea>
                 <div class="button-row">
-                    <button class="secondary" @onclick="SendTextOnlyAsync" disabled="@(!Client.IsConnected || string.IsNullOrWhiteSpace(TypedPrompt))">Text reply</button>
-                    <button class="primary" @onclick="SendSpokenTextAsync" disabled="@(!Client.IsConnected || string.IsNullOrWhiteSpace(TypedPrompt))">Speak reply</button>
+                    <button class="primary" @onclick="SendTextOnlyAsync" disabled="@(!Client.IsConnected || IsBusy || string.IsNullOrWhiteSpace(TypedPrompt))">Send text</button>
                 </div>
             </div>
         </div>
@@ -162,7 +179,7 @@
     private int AudioChunkCount;
 
     private bool CanConnect => !Client.IsConnected && !IsBusy && !string.IsNullOrWhiteSpace(ApiKey);
-    private string StatusClass => Client.IsConnected ? "connected" : IsBusy ? "busy" : "offline";
+    private string StatusClass => IsBusy ? "busy" : Client.IsConnected ? "connected" : "offline";
     private string MeterWidth => IsRecording ? "100%" : AudioChunkCount == 0 ? "8%" : "32%";
 
     protected override void OnInitialized()
@@ -189,24 +206,7 @@
 
         try
         {
-            if (RememberKey)
-            {
-                Preferences.Default.Set("openai_api_key", ApiKey);
-            }
-            else
-            {
-                Preferences.Default.Remove("openai_api_key");
-            }
-
-            await Js.InvokeVoidAsync("realtimeAudio.initPlayback");
-            await Client.ConnectAsync(new RealtimeSessionOptions
-            {
-                ApiKey = ApiKey,
-                Model = Model,
-                Voice = Voice,
-                Instructions = Instructions,
-                EnableInputTranscription = true
-            });
+            await ConnectCurrentSessionAsync();
         }
         catch (Exception ex)
         {
@@ -219,6 +219,70 @@
         }
     }
 
+    private async Task OnVoiceChangedAsync(ChangeEventArgs args)
+    {
+        var selectedVoice = args.Value?.ToString()?.Trim();
+        if (string.IsNullOrWhiteSpace(selectedVoice) || string.Equals(selectedVoice, Voice, StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        Voice = selectedVoice;
+
+        if (!Client.IsConnected)
+        {
+            return;
+        }
+
+        var restartCapture = IsRecording;
+        IsBusy = true;
+        StatusText = $"Switching to {Voice}";
+        AddEvent(RealtimeNotificationKind.Status, $"Switching voice to {Voice}");
+
+        try
+        {
+            await StopCaptureOnlyAsync();
+            await Client.DisconnectAsync();
+            await ConnectCurrentSessionAsync();
+
+            if (restartCapture && Client.IsConnected)
+            {
+                await StartRecordingAsync();
+            }
+        }
+        catch (Exception ex)
+        {
+            AddEvent(RealtimeNotificationKind.Error, ex.Message);
+            StatusText = Client.IsConnected ? "Connected" : "Disconnected";
+        }
+        finally
+        {
+            IsBusy = false;
+        }
+    }
+
+    private async Task ConnectCurrentSessionAsync()
+    {
+        if (RememberKey)
+        {
+            Preferences.Default.Set("openai_api_key", ApiKey);
+        }
+        else
+        {
+            Preferences.Default.Remove("openai_api_key");
+        }
+
+        await Js.InvokeVoidAsync("realtimeAudio.initPlayback");
+        await Client.ConnectAsync(new RealtimeSessionOptions
+        {
+            ApiKey = ApiKey,
+            Model = Model,
+            Voice = Voice,
+            Instructions = Instructions,
+            EnableInputTranscription = true
+        });
+    }
+
     private async Task DisconnectAsync()
     {
         await StopCaptureOnlyAsync();
@@ -229,7 +293,7 @@
     {
         if (IsRecording)
         {
-            await StopAndRespondAsync();
+            await StopCaptureOnlyAsync();
             return;
         }
 
@@ -254,12 +318,6 @@
         IsRecording = true;
     }
 
-    private async Task StopAndRespondAsync()
-    {
-        await StopCaptureOnlyAsync();
-        await Client.CommitAudioAndRespondAsync();
-    }
-
     private async Task StopCaptureOnlyAsync()
     {
         if (!IsRecording)
@@ -273,15 +331,10 @@
 
     private async Task SendTextOnlyAsync()
     {
-        await SendTypedPromptAsync(speak: false);
+        await SendTypedPromptAsync();
     }
 
-    private async Task SendSpokenTextAsync()
-    {
-        await SendTypedPromptAsync(speak: true);
-    }
-
-    private async Task SendTypedPromptAsync(bool speak)
+    private async Task SendTypedPromptAsync()
     {
         var prompt = TypedPrompt.Trim();
         if (prompt.Length == 0)
@@ -293,7 +346,7 @@
         TypedPrompt = string.Empty;
         CurrentAssistantText = string.Empty;
         await Js.InvokeVoidAsync("realtimeAudio.resetPlayback");
-        await Client.SendTextAsync(prompt, speak);
+        await Client.SendTextAsync(prompt);
     }
 
     [JSInvokable]
@@ -327,6 +380,10 @@
                     AddEvent(notification.Kind, notification.Message);
                     break;
 
+                case RealtimeNotificationKind.ClientEvent:
+                    AddEvent(notification.Kind, notification.Message);
+                    break;
+
                 case RealtimeNotificationKind.ServerEvent:
                     AddEvent(notification.Kind, notification.EventType ?? notification.Message);
                     break;
@@ -355,6 +412,11 @@
                     break;
 
                 case RealtimeNotificationKind.ResponseDone:
+                    if (!string.IsNullOrWhiteSpace(notification.Delta))
+                    {
+                        CurrentAssistantText = notification.Delta.Trim();
+                    }
+
                     if (!string.IsNullOrWhiteSpace(CurrentAssistantText))
                     {
                         Turns.Add(new Turn("assistant", CurrentAssistantText.Trim()));

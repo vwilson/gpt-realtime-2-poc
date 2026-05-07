@@ -7,6 +7,7 @@ window.realtimeAudio = (() => {
     let processorNode;
     let dotNetRef;
     let playbackTime = 0;
+    let chunkSendChain = Promise.resolve();
 
     async function initPlayback() {
         playbackContext ??= new (window.AudioContext || window.webkitAudioContext)();
@@ -18,6 +19,7 @@ window.realtimeAudio = (() => {
 
     async function startCapture(ref) {
         dotNetRef = ref;
+        chunkSendChain = Promise.resolve();
         await initPlayback();
 
         try {
@@ -40,7 +42,9 @@ window.realtimeAudio = (() => {
                 const base64 = encodePcm16(resampled);
 
                 if (base64 && dotNetRef) {
-                    await dotNetRef.invokeMethodAsync("OnAudioChunk", base64);
+                    chunkSendChain = chunkSendChain
+                        .then(() => dotNetRef?.invokeMethodAsync("OnAudioChunk", base64))
+                        .catch((error) => console.warn("Unable to send audio chunk", error))
                 }
             };
 
@@ -78,6 +82,8 @@ window.realtimeAudio = (() => {
             await captureContext.close();
             captureContext = null;
         }
+
+        await chunkSendChain;
     }
 
     async function playPcm16Base64(base64) {

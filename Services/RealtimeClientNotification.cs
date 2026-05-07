@@ -3,6 +3,7 @@ namespace RealtimeVibe.Services;
 public enum RealtimeNotificationKind
 {
     Status,
+    ClientEvent,
     ServerEvent,
     AssistantDelta,
     UserTranscript,
