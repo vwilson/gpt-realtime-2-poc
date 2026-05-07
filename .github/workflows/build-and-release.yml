@@ -1,0 +1,186 @@
+name: Build and Release
+
+on:
+  push:
+    branches:
+      - master
+    tags:
+      - "v*"
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      create_release:
+        description: "Create or update a GitHub Release from this run"
+        required: true
+        type: boolean
+        default: false
+      tag:
+        description: "Release tag, for example v0.1.0. Required when create_release is true."
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  DOTNET_VERSION: "10.0.x"
+  PROJECT_PATH: RealtimeVibe.csproj
+  WINDOWS_TFM: net10.0-windows10.0.19041.0
+  MAC_TFM: net10.0-maccatalyst
+
+jobs:
+  build-windows:
+    name: Windows x64
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Install MAUI workload
+        shell: pwsh
+        run: dotnet workload install maui-windows
+
+      - name: Publish Windows app
+        shell: pwsh
+        run: |
+          $publishDir = Join-Path $env:RUNNER_TEMP "realtime-vibe-windows-x64"
+          dotnet publish $env:PROJECT_PATH `
+            -f $env:WINDOWS_TFM `
+            -c Release `
+            -p:WindowsPackageType=None `
+            -p:RuntimeIdentifier=win-x64 `
+            -p:SelfContained=true `
+            -o $publishDir
+
+          New-Item -ItemType Directory -Force -Path release-assets | Out-Null
+          Compress-Archive `
+            -Path (Join-Path $publishDir "*") `
+            -DestinationPath "release-assets/realtime-vibe-windows-x64.zip" `
+            -Force
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: realtime-vibe-windows-x64
+          path: release-assets/realtime-vibe-windows-x64.zip
+          if-no-files-found: error
+
+  build-mac:
+    name: Mac Catalyst ${{ matrix.rid }}
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        rid:
+          - maccatalyst-x64
+          - maccatalyst-arm64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Install MAUI workload
+        run: dotnet workload install maui-maccatalyst
+
+      - name: Publish Mac Catalyst app
+        env:
+          RID: ${{ matrix.rid }}
+        run: |
+          set -euo pipefail
+
+          publish_dir="$RUNNER_TEMP/realtime-vibe-$RID"
+          dotnet publish "$PROJECT_PATH" \
+            -f "$MAC_TFM" \
+            -c Release \
+            -p:RuntimeIdentifier="$RID" \
+            -p:CreatePackage=false \
+            -p:EnableCodeSigning=false \
+            -p:_RequireCodeSigning=false \
+            -p:MtouchLink=SdkOnly \
+            -o "$publish_dir"
+
+          app_path="$(find "$publish_dir" -maxdepth 4 -type d -name "*.app" | head -n 1)"
+          if [[ -z "$app_path" ]]; then
+            echo "::error::No .app bundle was produced."
+            find "$publish_dir" -maxdepth 4 -print
+            exit 1
+          fi
+
+          mkdir -p release-assets
+          ditto -c -k --sequesterRsrc --keepParent "$app_path" "release-assets/realtime-vibe-macos-$RID.zip"
+
+      - name: Upload Mac artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: realtime-vibe-macos-${{ matrix.rid }}
+          path: release-assets/realtime-vibe-macos-${{ matrix.rid }}.zip
+          if-no-files-found: error
+
+  release:
+    name: GitHub Release
+    runs-on: ubuntu-latest
+    needs:
+      - build-windows
+      - build-mac
+    if: github.ref_type == 'tag' || (github.event_name == 'workflow_dispatch' && inputs.create_release)
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+
+      - name: Create or update release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MANUAL_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            release_tag="$GITHUB_REF_NAME"
+          else
+            release_tag="$MANUAL_TAG"
+          fi
+
+          if [[ -z "$release_tag" ]]; then
+            echo "::error::A release tag is required for manual releases."
+            exit 1
+          fi
+
+          git fetch --tags origin
+          if ! git rev-parse -q --verify "refs/tags/$release_tag" >/dev/null; then
+            git tag "$release_tag" "$GITHUB_SHA"
+            git push origin "$release_tag"
+          fi
+
+          mapfile -t files < <(find release-assets -type f -name "*.zip" | sort)
+          if [[ "${#files[@]}" -eq 0 ]]; then
+            echo "::error::No release zip files were found."
+            find release-assets -maxdepth 4 -print
+            exit 1
+          fi
+
+          if gh release view "$release_tag" >/dev/null 2>&1; then
+            gh release upload "$release_tag" "${files[@]}" --clobber
+          else
+            gh release create "$release_tag" "${files[@]}" \
+              --title "Realtime Vibe $release_tag" \
+              --notes "Windows and unsigned Mac Catalyst builds for the GPT Realtime 2 POC."
+          fi
