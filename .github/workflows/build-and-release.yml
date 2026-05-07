@@ -96,15 +96,41 @@ jobs:
         run: |
           set -euo pipefail
 
-          xcode_path="$(find /Applications -maxdepth 1 -name "Xcode_26.4*.app" -print | sort | tail -n 1)"
+          if [[ -d "/Applications/Xcode_26.4.0.app" ]]; then
+            xcode_path="/Applications/Xcode_26.4.0.app"
+          else
+            xcode_path="$(find /Applications -maxdepth 1 -name "Xcode_26.4*.app" -print | sort | tail -n 1)"
+          fi
+
           if [[ -z "$xcode_path" ]]; then
             echo "::error::Xcode 26.4 is required for .NET 10 Mac Catalyst."
             ls -1 /Applications | grep '^Xcode' || true
             exit 1
           fi
 
-          sudo xcode-select -s "$xcode_path/Contents/Developer"
+          developer_dir="$xcode_path/Contents/Developer"
+          sdk_dir="$developer_dir/Platforms/MacOSX.platform/Developer/SDKs"
+
+          sudo xcode-select -s "$developer_dir"
+          echo "DEVELOPER_DIR=$developer_dir" >> "$GITHUB_ENV"
+          sudo xcodebuild -runFirstLaunch || true
+          xcrun --kill-cache
+
           xcodebuild -version
+          ls -la "$sdk_dir"
+
+          if [[ ! -e "$sdk_dir/MacOSX.sdk" ]]; then
+            sdk_path="$(find "$sdk_dir" -maxdepth 1 -name "MacOSX*.sdk" -type d -print | sort | tail -n 1)"
+            if [[ -z "$sdk_path" ]]; then
+              echo "::error::No macOS SDK was found in $sdk_dir."
+              exit 1
+            fi
+
+            sudo ln -s "$(basename "$sdk_path")" "$sdk_dir/MacOSX.sdk"
+          fi
+
+          xcrun --sdk macosx --show-sdk-path
+          xcrun --sdk macosx --find actool
 
       - name: Install MAUI workload
         run: dotnet workload install maui-maccatalyst
