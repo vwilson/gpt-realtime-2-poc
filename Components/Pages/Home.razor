@@ -1,0 +1,396 @@
+@page "/"
+@implements IDisposable
+@inject RealtimeClient Client
+@inject IJSRuntime Js
+
+<div class="studio-shell">
+    <header class="studio-header">
+        <div>
+            <p class="eyebrow">OpenAI Realtime</p>
+            <h1>gpt-realtime-2 voice lab</h1>
+        </div>
+        <span class="status-pill @StatusClass">@StatusText</span>
+    </header>
+
+    <section class="control-grid">
+        <div class="panel connection-panel">
+            <div class="panel-title">
+                <span>Session</span>
+                <button class="link-button" @onclick="LoadKeyFromEnvironment">Use env key</button>
+            </div>
+
+            <label>
+                API key
+                <input type="password" @bind="ApiKey" placeholder="sk-..." autocomplete="off" disabled="@Client.IsConnected" />
+            </label>
+
+            <div class="split">
+                <label>
+                    Model
+                    <input @bind="Model" disabled="@Client.IsConnected" />
+                </label>
+                <label>
+                    Voice
+                    <select @bind="Voice" disabled="@Client.IsConnected">
+                        @foreach (var voice in Voices)
+                        {
+                            <option value="@voice">@voice</option>
+                        }
+                    </select>
+                </label>
+            </div>
+
+            <label>
+                Instructions
+                <textarea @bind="Instructions" disabled="@Client.IsConnected"></textarea>
+            </label>
+
+            <div class="row-check">
+                <input id="remember-key" type="checkbox" @bind="RememberKey" disabled="@Client.IsConnected" />
+                <label for="remember-key">Remember key on this device</label>
+            </div>
+
+            <div class="button-row">
+                <button class="primary" @onclick="ConnectAsync" disabled="@(!CanConnect)">Connect</button>
+                <button class="secondary" @onclick="DisconnectAsync" disabled="@(!Client.IsConnected)">Disconnect</button>
+            </div>
+        </div>
+
+        <div class="panel talk-panel">
+            <div class="panel-title">
+                <span>Mic</span>
+                <span class="small-metric">@AudioChunkCount chunks</span>
+            </div>
+
+            <button class="talk-button @(IsRecording ? "recording" : "")" @onclick="ToggleRecordingAsync" disabled="@(!Client.IsConnected)">
+                <span>@(IsRecording ? "Stop and respond" : "Start talking")</span>
+            </button>
+
+            <div class="meter" aria-hidden="true">
+                <span style="width: @MeterWidth"></span>
+            </div>
+
+            <div class="quick-text">
+                <textarea @bind="TypedPrompt" placeholder="Type a prompt"></textarea>
+                <div class="button-row">
+                    <button class="secondary" @onclick="SendTextOnlyAsync" disabled="@(!Client.IsConnected || string.IsNullOrWhiteSpace(TypedPrompt))">Text reply</button>
+                    <button class="primary" @onclick="SendSpokenTextAsync" disabled="@(!Client.IsConnected || string.IsNullOrWhiteSpace(TypedPrompt))">Speak reply</button>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <section class="workspace-grid">
+        <div class="panel transcript-panel">
+            <div class="panel-title">
+                <span>Transcript</span>
+                <button class="link-button" @onclick="ClearTranscript">Clear</button>
+            </div>
+
+            <div class="turns">
+                @if (Turns.Count == 0 && string.IsNullOrWhiteSpace(CurrentAssistantText))
+                {
+                    <div class="empty-state">No turns yet.</div>
+                }
+
+                @foreach (var turn in Turns)
+                {
+                    <article class="turn @turn.Role">
+                        <span>@turn.Role</span>
+                        <p>@turn.Text</p>
+                    </article>
+                }
+
+                @if (!string.IsNullOrWhiteSpace(CurrentAssistantText))
+                {
+                    <article class="turn assistant live">
+                        <span>assistant</span>
+                        <p>@CurrentAssistantText</p>
+                    </article>
+                }
+            </div>
+        </div>
+
+        <div class="panel events-panel">
+            <div class="panel-title">
+                <span>Events</span>
+                <span class="small-metric">@Events.Count</span>
+            </div>
+
+            <div class="events">
+                @foreach (var entry in Events)
+                {
+                    <div class="event-row @entry.Kind.ToString().ToLowerInvariant()">
+                        <span>@entry.Time.ToString("HH:mm:ss")</span>
+                        <code>@entry.Message</code>
+                    </div>
+                }
+            </div>
+        </div>
+    </section>
+</div>
+
+@code {
+    private static readonly string[] Voices =
+    [
+        "marin",
+        "cedar",
+        "alloy",
+        "ash",
+        "ballad",
+        "coral",
+        "echo",
+        "sage",
+        "shimmer",
+        "verse"
+    ];
+
+    private readonly List<Turn> Turns = [];
+    private readonly List<EventEntry> Events = [];
+    private DotNetObjectReference<Home>? _dotNetRef;
+
+    private string ApiKey = string.Empty;
+    private string Model = "gpt-realtime-2";
+    private string Voice = "marin";
+    private string Instructions = new RealtimeSessionOptions().Instructions;
+    private string TypedPrompt = "Give me a 20 second demo of what makes GPT Realtime 2 different.";
+    private string StatusText = "Disconnected";
+    private string CurrentAssistantText = string.Empty;
+    private bool RememberKey;
+    private bool IsBusy;
+    private bool IsRecording;
+    private int AudioChunkCount;
+
+    private bool CanConnect => !Client.IsConnected && !IsBusy && !string.IsNullOrWhiteSpace(ApiKey);
+    private string StatusClass => Client.IsConnected ? "connected" : IsBusy ? "busy" : "offline";
+    private string MeterWidth => IsRecording ? "100%" : AudioChunkCount == 0 ? "8%" : "32%";
+
+    protected override void OnInitialized()
+    {
+        Client.NotificationReceived += OnNotification;
+        ApiKey = Preferences.Default.Get("openai_api_key", string.Empty);
+        RememberKey = !string.IsNullOrWhiteSpace(ApiKey);
+        LoadKeyFromEnvironment();
+    }
+
+    private void LoadKeyFromEnvironment()
+    {
+        var environmentKey = Environment.GetEnvironmentVariable("OPENAI_API_KEY");
+        if (!string.IsNullOrWhiteSpace(environmentKey))
+        {
+            ApiKey = environmentKey;
+        }
+    }
+
+    private async Task ConnectAsync()
+    {
+        IsBusy = true;
+        StatusText = "Connecting";
+
+        try
+        {
+            if (RememberKey)
+            {
+                Preferences.Default.Set("openai_api_key", ApiKey);
+            }
+            else
+            {
+                Preferences.Default.Remove("openai_api_key");
+            }
+
+            await Js.InvokeVoidAsync("realtimeAudio.initPlayback");
+            await Client.ConnectAsync(new RealtimeSessionOptions
+            {
+                ApiKey = ApiKey,
+                Model = Model,
+                Voice = Voice,
+                Instructions = Instructions,
+                EnableInputTranscription = true
+            });
+        }
+        catch (Exception ex)
+        {
+            AddEvent(RealtimeNotificationKind.Error, ex.Message);
+            StatusText = "Disconnected";
+        }
+        finally
+        {
+            IsBusy = false;
+        }
+    }
+
+    private async Task DisconnectAsync()
+    {
+        await StopCaptureOnlyAsync();
+        await Client.DisconnectAsync();
+    }
+
+    private async Task ToggleRecordingAsync()
+    {
+        if (IsRecording)
+        {
+            await StopAndRespondAsync();
+            return;
+        }
+
+        await StartRecordingAsync();
+    }
+
+    private async Task StartRecordingAsync()
+    {
+        if (!Client.IsConnected)
+        {
+            return;
+        }
+
+        AudioChunkCount = 0;
+        CurrentAssistantText = string.Empty;
+        await Js.InvokeVoidAsync("realtimeAudio.resetPlayback");
+        await Client.ClearInputAudioAsync();
+
+        _dotNetRef?.Dispose();
+        _dotNetRef = DotNetObjectReference.Create(this);
+        await Js.InvokeVoidAsync("realtimeAudio.startCapture", _dotNetRef);
+        IsRecording = true;
+    }
+
+    private async Task StopAndRespondAsync()
+    {
+        await StopCaptureOnlyAsync();
+        await Client.CommitAudioAndRespondAsync();
+    }
+
+    private async Task StopCaptureOnlyAsync()
+    {
+        if (!IsRecording)
+        {
+            return;
+        }
+
+        await Js.InvokeVoidAsync("realtimeAudio.stopCapture");
+        IsRecording = false;
+    }
+
+    private async Task SendTextOnlyAsync()
+    {
+        await SendTypedPromptAsync(speak: false);
+    }
+
+    private async Task SendSpokenTextAsync()
+    {
+        await SendTypedPromptAsync(speak: true);
+    }
+
+    private async Task SendTypedPromptAsync(bool speak)
+    {
+        var prompt = TypedPrompt.Trim();
+        if (prompt.Length == 0)
+        {
+            return;
+        }
+
+        Turns.Add(new Turn("user", prompt));
+        TypedPrompt = string.Empty;
+        CurrentAssistantText = string.Empty;
+        await Js.InvokeVoidAsync("realtimeAudio.resetPlayback");
+        await Client.SendTextAsync(prompt, speak);
+    }
+
+    [JSInvokable]
+    public async Task OnAudioChunk(string base64Pcm16)
+    {
+        AudioChunkCount++;
+        await Client.AppendAudioAsync(base64Pcm16);
+
+        if (AudioChunkCount % 6 == 0)
+        {
+            await InvokeAsync(StateHasChanged);
+        }
+    }
+
+    [JSInvokable]
+    public Task OnAudioError(string message)
+    {
+        AddEvent(RealtimeNotificationKind.Error, message);
+        IsRecording = false;
+        return InvokeAsync(StateHasChanged);
+    }
+
+    private void OnNotification(RealtimeClientNotification notification)
+    {
+        _ = InvokeAsync(async () =>
+        {
+            switch (notification.Kind)
+            {
+                case RealtimeNotificationKind.Status:
+                    StatusText = notification.Message;
+                    AddEvent(notification.Kind, notification.Message);
+                    break;
+
+                case RealtimeNotificationKind.ServerEvent:
+                    AddEvent(notification.Kind, notification.EventType ?? notification.Message);
+                    break;
+
+                case RealtimeNotificationKind.AudioDelta:
+                    if (!string.IsNullOrWhiteSpace(notification.Delta))
+                    {
+                        await Js.InvokeVoidAsync("realtimeAudio.playPcm16Base64", notification.Delta);
+                    }
+                    break;
+
+                case RealtimeNotificationKind.AssistantDelta:
+                    CurrentAssistantText += notification.Delta;
+                    break;
+
+                case RealtimeNotificationKind.UserTranscript:
+                    if (!string.IsNullOrWhiteSpace(notification.Delta))
+                    {
+                        Turns.Add(new Turn("user", notification.Delta));
+                    }
+                    break;
+
+                case RealtimeNotificationKind.Error:
+                    StatusText = Client.IsConnected ? "Connected" : "Disconnected";
+                    AddEvent(notification.Kind, notification.Message);
+                    break;
+
+                case RealtimeNotificationKind.ResponseDone:
+                    if (!string.IsNullOrWhiteSpace(CurrentAssistantText))
+                    {
+                        Turns.Add(new Turn("assistant", CurrentAssistantText.Trim()));
+                        CurrentAssistantText = string.Empty;
+                    }
+                    AddEvent(notification.Kind, notification.Message);
+                    break;
+            }
+
+            StateHasChanged();
+        });
+    }
+
+    private void AddEvent(RealtimeNotificationKind kind, string message)
+    {
+        Events.Insert(0, new EventEntry(DateTimeOffset.Now, kind, message));
+
+        if (Events.Count > 80)
+        {
+            Events.RemoveRange(80, Events.Count - 80);
+        }
+    }
+
+    private void ClearTranscript()
+    {
+        Turns.Clear();
+        CurrentAssistantText = string.Empty;
+    }
+
+    public void Dispose()
+    {
+        Client.NotificationReceived -= OnNotification;
+        _dotNetRef?.Dispose();
+    }
+
+    private sealed record Turn(string Role, string Text);
+
+    private sealed record EventEntry(DateTimeOffset Time, RealtimeNotificationKind Kind, string Message);
+}
