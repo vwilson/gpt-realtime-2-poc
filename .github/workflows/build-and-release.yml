@@ -168,8 +168,8 @@ jobs:
             -p:CreatePackage=false \
             -p:EnableCodeSigning=false \
             -p:_RequireCodeSigning=false \
-            -p:ACToolPath="$MD_APPLE_SDK_ROOT/Contents/Developer/usr/bin" \
-            -p:IBToolPath="$MD_APPLE_SDK_ROOT/Contents/Developer/usr/bin" \
+            -p:ACToolPath="$MD_APPLE_SDK_ROOT/Contents/Developer/usr/bin/actool" \
+            -p:IBToolPath="$MD_APPLE_SDK_ROOT/Contents/Developer/usr/bin/ibtool" \
             -p:MtouchLink=SdkOnly \
             -o "$publish_dir"
 
